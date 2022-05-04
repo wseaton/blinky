@@ -4,7 +4,6 @@ use deku::prelude::*;
 use hexlit::hex;
 use hidapi::{HidApi, HidDevice};
 use tracing::metadata::LevelFilter;
-use std::{thread, time};
 
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
 #[deku(endian = "big")]
@@ -40,6 +39,22 @@ pub struct BlyncControl {
     footer: u16,
 }
 
+impl BlyncControl {
+    fn default() -> BlyncControl {
+        // this is what a 'zeroed' struct hexdump would look like.
+        // we can use it to start a builder style pattern.
+        let zeroed_data = hex!("00000000000000ff22");
+        BlyncControl::try_from(zeroed_data.as_ref()).unwrap()
+    }
+
+    fn with_color(&mut self, r: u8, g: u8, b: u8) -> &mut BlyncControl {
+        self.red = r;
+        self.green = g;
+        self.blue = b;
+        self
+    }
+}
+
 // typedef struct {
 //     unsigned int header: 8;  /* 64:71 Constant: 0x00 */
 //     unsigned int red:    8;  /* 56:63 Red color value [-255] */
@@ -63,28 +78,38 @@ pub struct BlyncControl {
 fn main() -> Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
-    .with_max_level(LevelFilter::DEBUG)
-    .init();
+        .with_max_level(LevelFilter::DEBUG)
+        .init();
 
     let api = HidApi::new()?;
     let dev = api.open(0x2c0d, 0x0010)?;
 
-    let duration = 50;
-
-    for _ in 1..3 {
-        set_color(&dev, 255, 0, 0)?;
-        thread::sleep(time::Duration::from_millis(duration));
-        set_color(&dev, 0, 0, 255)?;
-        thread::sleep(time::Duration::from_millis(duration));
-    }
-
-    set_color(&dev, 0, 0, 0)?;
+    blink_pulse(dev, Some(2))?;
 
     Ok(())
 }
 
+fn blink_pulse(dev: HidDevice, num_blinks: Option<u8>) -> Result<(), color_eyre::Report> {
+    let blinks = num_blinks.unwrap_or(3);
 
-/// ~other fun things~ 
+    for _ in 1..(blinks + 1) {
+        // optional sleep here, it's smoother if left out though.
+        // thread::sleep(time::Duration::from_millis(duration));
+        for x in 1..(255 * 2) {
+            let mut z = x as i16;
+            // bidirectional fade hacks
+            if z > 255 {
+                z = -z;
+            }
+            set_color(&dev, 255, (z / 2) as u8, z as u8)?;
+        }
+    }
+    turn_off(&dev)?;
+    Ok(())
+}
+
+/// ~other fun things~
+///
 /// bc.flash = 1;
 /// bc.speed = 1<<0;
 /// bc.off = 1;
@@ -94,18 +119,23 @@ fn main() -> Result<()> {
 /// bc.mute = 0;
 /// bc.repeat = 0;
 fn set_color(dev: &HidDevice, r: u8, g: u8, b: u8) -> Result<()> {
-    // basic 'blue' message without blink
-    // 0000   09 00 02 00 00 08 00 00 00 00 09 00 80 ff 22
-    let test_bytes = hex!("00000000000000ff22");
-    let mut bc = BlyncControl::try_from(test_bytes.as_ref()).unwrap();
+    let mut bc = BlyncControl::default();
+    let x = bc.with_color(r, g, b);
+    write_data(dev, &x)?;
+    Ok(())
+}
 
-    bc.red = r;
-    bc.green = g;
-    bc.blue = b;
+fn turn_off(dev: &HidDevice) -> Result<()> {
+    let mut bc = BlyncControl::default();
+    // color has to be 'zeroed' as well, just because.
+    bc.off = 1;
+    write_data(dev, &bc)?;
+    Ok(())
+}
 
-    let s = bc.to_bits().unwrap();
-    tracing::info!("Writing bytes {:?}", s);
-    let _ = dev.write(s.as_raw_slice());
-
+fn write_data(dev: &HidDevice, data: &BlyncControl) -> Result<()> {
+    let d = data.to_bits()?;
+    let res = dev.write(d.as_raw_slice())?;
+    tracing::info!("Wrote {} bytes.", res);
     Ok(())
 }
