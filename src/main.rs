@@ -56,17 +56,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Program to upload the vault secret for a DET namespace into vault automatically
-    ///
-    /// Dependencies:
-    ///    - vault, oc (oc login must be run before running this program) or a valid kubeconfig
-    ///    - environment variables: ASTRONOMER_TOKEN, VAULT_SECRET_ID
     Zap {
         #[clap(short, long)]
         color: String,
         #[clap(short, long, default_value = "100")]
         num_blinks: u64,
-        #[clap(short, long, value_parser = parse_flashspeed, default_value = "fast")]
+        #[clap(short, long, value_parser = parse_flashspeed, default_value = "slow")]
         flash_speed: FlashSpeed,
     },
 }
