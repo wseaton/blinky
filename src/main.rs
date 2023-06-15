@@ -67,13 +67,12 @@ enum Commands {
 }
 
 fn parse_flashspeed(input: &str) -> Result<FlashSpeed> {
-    let res = match input {
+    match input {
         "fast" => Ok(FlashSpeed::Fast),
         "medium" => Ok(FlashSpeed::Medium),
         "slow" => Ok(FlashSpeed::Slow),
         _ => panic!("Invalid flash speed: {}", input),
-    };
-    res
+    }
 }
 
 impl BlyncControl {
@@ -142,23 +141,19 @@ fn main() -> Result<()> {
 }
 
 // A constant representing the max color value
-const MAX_COLOR: u16 = 255;
+const MAX_COLOR: u8 = 255;
 
 fn blink_pulse(dev: HidDevice, num_blinks: Option<u8>) -> Result<(), color_eyre::Report> {
     let blinks = num_blinks.unwrap_or(2);
+    let iters = (MAX_COLOR as u16 * 2).into();
 
     for _ in 1..=blinks {
-        for x in 1..=(MAX_COLOR * 2) {
+        for x in 1..iters {
             let mut z = x as i16;
             if z > MAX_COLOR as i16 {
                 z = -z;
             }
-            set_color(
-                &dev,
-                MAX_COLOR.try_into().expect("We know this will fit"),
-                0_u8,
-                z as u8,
-            )?;
+            set_color(&dev, MAX_COLOR, 0_u8, z as u8)?;
         }
     }
     turn_off(&dev)?;
@@ -203,7 +198,7 @@ impl From<FlashSpeed> for u8 {
 }
 
 impl FlashSpeed {
-    fn to_u8(&self) -> u8 {
+    fn to_u8(self) -> u8 {
         match self {
             FlashSpeed::Slow => 1 << 0,
             FlashSpeed::Medium => 1 << 1,
