@@ -64,6 +64,14 @@ enum Commands {
         #[clap(short, long, value_parser = parse_flashspeed, default_value = "slow")]
         flash_speed: FlashSpeed,
     },
+    Hold {
+        #[clap(short, long)]
+        color: String,
+
+        #[clap(short, long, default_value = "2000")]
+        // duration in milliseconds
+        duration: u64,
+    },
 }
 
 fn parse_flashspeed(input: &str) -> Result<FlashSpeed> {
@@ -130,6 +138,13 @@ fn main() -> Result<()> {
             tracing::info!("Zapping with color: {}", color);
             let c = color_from_name(&color).expect("Failed to get color from name");
             flash_color(&dev, c.0, c.1, c.2, flash_speed, num_blinks)?;
+            turn_off(&dev)?;
+        }
+        Some(Commands::Hold { color, duration }) => {
+            tracing::info!("Holding with color: {}", color);
+            let c = color_from_name(&color).expect("Failed to get color from name");
+            set_color(&dev, c.0, c.1, c.2)?;
+            std::thread::sleep(std::time::Duration::from_millis(duration));
             turn_off(&dev)?;
         }
         None => {
