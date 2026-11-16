@@ -1,272 +1,173 @@
-extern crate hidapi;
-use std::num;
+use std::{thread, time::Duration};
 
+use blinky::{Blynclight, Color, FlashSpeed};
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::Result;
-use deku::prelude::*;
-use eyre::WrapErr;
-use hexlit::hex;
-use hidapi::{HidApi, HidDevice};
-use palette::{encoding::Srgb, named, rgb::Rgb, Srgb as SrgbColorSpace};
+use color_eyre::eyre::{Result, eyre};
 use tracing::metadata::LevelFilter;
 
-#[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-#[deku(endian = "big")]
-/// BlyncControl represents a structure used for controlling Blync light.
-/// Each field corresponds to a feature of the Blync light that can be controlled.
-pub struct BlyncControl {
-    header: u8,
-    red: u8,   // Red color value [0-255]
-    green: u8, // Green color value [0-255]
-    blue: u8,  // Blue color value [0-255]
-    #[deku(bits = "1")]
-    off: u8, // Set is off, zero is on
-    #[deku(bits = "1")]
-    dim: u8, // Set is dim, zero is bright
-    #[deku(bits = "1")]
-    flash: u8, // Set is flash on/off, zero is steady
-    #[deku(bits = "3")]
-    speed: u8, // Flash speed mask: 1<<0, 1<<1, 1<<2
-    #[deku(bits = "2")]
-    pad0: u8, // Unused bits
-    #[deku(bits = "4")]
-    music: u8, // Stored music index: [0-15]
-    #[deku(bits = "1")]
-    play: u8, // Set play selected music, zero is stop
-    #[deku(bits = "1")]
-    repeat: u8, // Set repeats playing music, zero is once
-    #[deku(bits = "2")]
-    pad1: u8, // Unused bits
-    #[deku(bits = "4")]
-    volume: u8, // Volume of music: [0-15]
-    #[deku(bits = "1")]
-    mute: u8, // Set is mute, zero is unmute
-    #[deku(bits = "3")]
-    pad2: u8, // Unused bits
-    footer: u16,
-}
-
-#[derive(Parser)]
-#[clap(author, version, about, long_about = None)]
-#[clap(propagate_version = true)]
+#[derive(Debug, Parser)]
+#[command(author, version, about, long_about = None, propagate_version = true)]
 struct Cli {
-    #[clap(subcommand)]
-    command: Option<Commands>,
+    #[command(subcommand)]
+    command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, PartialEq, Subcommand)]
 enum Commands {
+    /// Blink a color a number of times, then turn the light off
     Zap {
-        #[clap(short, long)]
-        color: String,
-        #[clap(short, long, default_value = "100")]
+        #[arg(short, long)]
+        color: Color,
+        #[arg(short, long, default_value_t = 100)]
         num_blinks: u64,
-        #[clap(short, long, value_parser = parse_flashspeed, default_value = "slow")]
+        #[arg(short, long, value_enum, default_value_t = FlashSpeed::Slow)]
         flash_speed: FlashSpeed,
     },
+    /// Show a color, steady or flashing, and leave it on unless a duration is given
     Hold {
-        #[clap(short, long)]
-        color: String,
+        #[arg(short, long)]
+        color: Color,
 
-        #[clap(short, long, default_value = "2000")]
-        // duration in milliseconds
-        duration: u64,
+        /// Milliseconds to hold before turning the light off
+        #[arg(short, long)]
+        duration: Option<u64>,
+
+        /// Flash at this speed
+        #[arg(short, long, value_enum)]
+        flash_speed: Option<FlashSpeed>,
     },
+    /// Turn the light off
+    Off,
 }
 
-fn parse_flashspeed(input: &str) -> Result<FlashSpeed> {
-    match input {
-        "fast" => Ok(FlashSpeed::Fast),
-        "medium" => Ok(FlashSpeed::Medium),
-        "slow" => Ok(FlashSpeed::Slow),
-        _ => panic!("Invalid flash speed: {}", input),
-    }
-}
-
-impl BlyncControl {
-    /// Constructs a new `BlyncControl` with all fields set to zero.
-    fn zeroed() -> Result<BlyncControl> {
-        let zeroed_data = hex!("00000000000000ff22");
-        BlyncControl::try_from(zeroed_data.as_ref())
-            .wrap_err_with(|| format!("Failed to parse zeroed data: {:?}", zeroed_data))
-    }
-
-    /// Constructs a new `BlyncControl` with color fields set to the given RGB values.
-    fn with_color(r: u8, g: u8, b: u8) -> Result<BlyncControl> {
-        let mut control = Self::zeroed()?;
-        control.red = r;
-        control.green = g;
-        control.blue = b;
-        Ok(control)
-    }
-}
 fn main() -> Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
         .with_max_level(LevelFilter::INFO)
+        .with_writer(std::io::stderr)
         .init();
-
-    println!("Printing all available hid devices:");
-
-    match HidApi::new() {
-        Ok(api) => {
-            for device in api.device_list() {
-                tracing::info!(
-                    "{:04x}:{:04x} {}",
-                    device.vendor_id(),
-                    device.product_id(),
-                    device.product_string().unwrap_or("")
-                );
-            }
-        }
-        Err(e) => {
-            tracing::error!("Error: {}", e);
-        }
-    }
 
     let cli = Cli::parse();
 
-    let api = HidApi::new()?;
-    let dev = api.open(0x2c0d, 0x0010)?;
+    let light =
+        Blynclight::open()?.ok_or_else(|| eyre!("no Blynclight found, is it plugged in?"))?;
 
     match cli.command {
-        Some(Commands::Zap {
+        Commands::Zap {
             color,
             num_blinks,
             flash_speed,
-        }) => {
-            tracing::info!("Zapping with color: {}", color);
-            let c = color_from_name(&color).expect("Failed to get color from name");
-            flash_color(&dev, c.0, c.1, c.2, flash_speed, num_blinks)?;
-            turn_off(&dev)?;
+        } => {
+            tracing::info!("Zapping with color: {:?}", color);
+            light.flash_color(color, flash_speed, num_blinks)?;
+            light.off()?;
         }
-        Some(Commands::Hold { color, duration }) => {
-            tracing::info!("Holding with color: {}", color);
-            let c = color_from_name(&color).expect("Failed to get color from name");
-            set_color(&dev, c.0, c.1, c.2)?;
-            std::thread::sleep(std::time::Duration::from_millis(duration));
-            turn_off(&dev)?;
-        }
-        None => {
-            tracing::info!("No command provided, doing nothing");
-        }
-    }
-
-    Ok(())
-}
-
-// A constant representing the max color value
-const MAX_COLOR: u8 = 255;
-
-fn blink_pulse(dev: HidDevice, num_blinks: Option<u8>) -> Result<(), color_eyre::Report> {
-    let blinks = num_blinks.unwrap_or(2);
-    let iters = (MAX_COLOR as u16 * 2).into();
-
-    for _ in 1..=blinks {
-        for x in 1..iters {
-            let mut z = x as i16;
-            if z > MAX_COLOR as i16 {
-                z = -z;
+        Commands::Hold {
+            color,
+            duration,
+            flash_speed,
+        } => {
+            tracing::info!("Holding with color: {:?}", color);
+            light.show(color, flash_speed)?;
+            if let Some(duration) = duration {
+                thread::sleep(Duration::from_millis(duration));
+                light.off()?;
             }
-            set_color(&dev, MAX_COLOR, 0_u8, z as u8)?;
         }
+        Commands::Off => light.off()?,
     }
-    turn_off(&dev)?;
+
     Ok(())
 }
 
-/// Sets the color of the device using the provided RGB values.
-fn set_color(dev: &HidDevice, r: u8, g: u8, b: u8) -> Result<()> {
-    let bc = BlyncControl::with_color(r, g, b)?;
-    write_data(dev, &bc)
-}
+#[cfg(test)]
+mod tests {
+    use blinky::{Color, FlashSpeed};
+    use clap::{CommandFactory, Parser};
 
-/// Turns off the device.
-fn turn_off(dev: &HidDevice) -> Result<()> {
-    let mut bc = BlyncControl::zeroed()?;
-    // color has to be 'zeroed' as well, just because.
-    bc.off = 1;
-    tracing::info!("Turning off!");
-    write_data(dev, &bc)
-}
+    use crate::{Cli, Commands};
 
-/// Writes the provided BlyncControl data to the device.
-fn write_data(dev: &HidDevice, data: &BlyncControl) -> Result<()> {
-    let d = data.to_bits()?;
-    let res = dev.write(d.as_raw_slice())?;
-    tracing::debug!("Wrote: {:x}, it was {} bytes.", &d, res);
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-enum FlashSpeed {
-    Slow,
-    Medium,
-    Fast,
-}
-
-// implt To u8 for FlashSpeed
-impl From<FlashSpeed> for u8 {
-    fn from(f: FlashSpeed) -> u8 {
-        f.to_u8()
+    fn parse(args: &[&str]) -> Result<Commands, clap::Error> {
+        Cli::try_parse_from(args).map(|cli| cli.command)
     }
-}
 
-impl FlashSpeed {
-    fn to_u8(self) -> u8 {
-        match self {
-            FlashSpeed::Slow => 1 << 0,
-            FlashSpeed::Medium => 1 << 1,
-            FlashSpeed::Fast => 1 << 2,
-        }
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
-}
 
-/// Flashes the color of the device using the provided RGB values and the specified frequency.
-fn flash_color(
-    dev: &HidDevice,
-    r: u8,
-    g: u8,
-    b: u8,
-    frequency: FlashSpeed,
-    num_times: u64,
-) -> Result<()> {
-    let bc = BlyncControl::with_color(r, g, b)?;
-    let mut flash_bc = bc;
-    flash_bc.flash = 1;
-    flash_bc.speed = frequency.into();
-    for _ in 0..num_times {
-        write_data(dev, &flash_bc)?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        turn_off(dev)?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    #[test]
+    fn zap_defaults_to_100_slow_blinks() {
+        assert_eq!(
+            parse(&["blinky", "zap", "--color", "red"]).unwrap(),
+            Commands::Zap {
+                color: Color::RED,
+                num_blinks: 100,
+                flash_speed: FlashSpeed::Slow,
+            }
+        );
     }
-    Ok(())
-}
 
-fn strobe(dev: &HidDevice, r: u8, g: u8, b: u8, delay: u64, times: u32) -> Result<()> {
-    for _ in 0..times {
-        set_color(dev, r, g, b)?;
-        std::thread::sleep(std::time::Duration::from_millis(delay));
-        turn_off(dev)?;
-        std::thread::sleep(std::time::Duration::from_millis(delay));
+    #[test]
+    fn zap_accepts_short_flags() {
+        assert_eq!(
+            parse(&["blinky", "zap", "-c", "red", "-n", "3", "-f", "fast"]).unwrap(),
+            Commands::Zap {
+                color: Color::RED,
+                num_blinks: 3,
+                flash_speed: FlashSpeed::Fast,
+            }
+        );
     }
-    Ok(())
-}
 
-fn transition_colors(dev: &HidDevice, start: (u8, u8, u8), end: (u8, u8, u8)) -> Result<()> {
-    let steps = 100; // Define how smooth you want the transition
-    for i in 0..steps {
-        let r = start.0 + ((end.0 - start.0) * i / steps);
-        let g = start.1 + ((end.1 - start.1) * i / steps);
-        let b = start.2 + ((end.2 - start.2) * i / steps);
-        set_color(dev, r, g, b)?;
-        std::thread::sleep(std::time::Duration::from_millis(100)); // Adjust for the speed of transition
+    #[test]
+    fn hold_is_steady_and_indefinite_by_default() {
+        assert_eq!(
+            parse(&["blinky", "hold", "-c", "red"]).unwrap(),
+            Commands::Hold {
+                color: Color::RED,
+                duration: None,
+                flash_speed: None,
+            }
+        );
     }
-    Ok(())
-}
 
-/// Converts a named color to a RGB tuple. If the color name isn't recognized, returns `None`.
-fn color_from_name(name: &str) -> Option<(u8, u8, u8)> {
-    named::from_str(name).map(|c| (c.red, c.green, c.blue))
+    #[test]
+    fn hold_accepts_duration_and_flash_speed() {
+        assert_eq!(
+            parse(&[
+                "blinky",
+                "hold",
+                "--color",
+                "red",
+                "--duration",
+                "1500",
+                "--flash-speed",
+                "medium"
+            ])
+            .unwrap(),
+            Commands::Hold {
+                color: Color::RED,
+                duration: Some(1500),
+                flash_speed: Some(FlashSpeed::Medium),
+            }
+        );
+    }
+
+    #[test]
+    fn off_takes_no_arguments() {
+        assert_eq!(parse(&["blinky", "off"]).unwrap(), Commands::Off);
+        assert!(parse(&["blinky", "off", "--color", "red"]).is_err());
+    }
+
+    #[test]
+    fn invalid_invocations_are_rejected() {
+        assert!(parse(&["blinky"]).is_err());
+        assert!(parse(&["blinky", "zap"]).is_err());
+        assert!(parse(&["blinky", "hold"]).is_err());
+        assert!(parse(&["blinky", "hold", "-c", "notacolor"]).is_err());
+        assert!(parse(&["blinky", "hold", "-c", "red", "-f", "warp"]).is_err());
+        assert!(parse(&["blinky", "zap", "-c", "red", "-n", "-1"]).is_err());
+        assert!(parse(&["blinky", "nope"]).is_err());
+    }
 }
